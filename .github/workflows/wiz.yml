@@ -16,7 +16,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: pip install requests rich
+        run: pip install requests tabulate
 
       - name: Download Wiz CLI
         run: |
