@@ -43,7 +43,7 @@ def get_finding_details(token, finding_id):
 def main():
     console.print("[bold blue]Step 1:[/bold blue] Running Wiz CLI scan...")
     # Run scan; check=False because exit code 4 (findings found) shouldn't crash the script
-    subprocess.run(["wizcli", "scan", "dir", ".", "--output", "sarif", "--sarif-output-file", "raw.sarif"], check=False)
+    subprocess.run(["wizcli", "scan", "dir", ".", "--stdout", "sarif", "--sarif-output-file", "raw.sarif"], check=False)
 
     if not os.path.exists("raw.sarif"):
         console.print("[bold red]Error:[/bold red] Scan failed to produce raw.sarif")
