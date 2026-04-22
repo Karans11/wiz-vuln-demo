@@ -184,7 +184,21 @@ def main():
         any_found = True
         with open(path) as f:
             sarif = json.load(f)
+
         rows = extract_rows(sarif)
+
+        # Dedupe: one finding per component+version
+        seen = set()
+        deduped = []
+        for r in rows:
+            key = (r["component"], r["version"])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(r)
+
+        # Keep only top 3 (already sorted by severity)
+        rows = deduped[:3]
+
         counts = print_report(title, rows)
         write_summary(title, rows, counts)
 
