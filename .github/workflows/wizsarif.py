@@ -31,7 +31,6 @@ SEVERITY_ORDER = {
 }
 
 # CVSS-style numeric severity GitHub uses for proper severity badges
-# (https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning#reportingdescriptor-object)
 SECURITY_SEVERITY = {
     "CRITICAL": "9.5",
     "HIGH":     "8.0",
@@ -228,6 +227,155 @@ def write_summary(title, rows, counts):
             f.write("\n")
 
 
+def print_layer_report(json_path="image-layers.json"):
+    """Print per-layer vulnerability breakdown from wizcli JSON output."""
+    if not os.path.exists(json_path):
+        print(f"\nSkipping layer report: {json_path} not found")
+        return
+
+    try:
+        with open(json_path) as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"\nError reading {json_path}: {e}")
+        return
+
+    # wizcli JSON structure: result.osPackages[], result.libraries[], each with layerID/layerDigest
+    result = data.get("result", {}) or {}
+    os_packages = result.get("osPackages", []) or []
+    libraries = result.get("libraries", []) or []
+    all_findings = os_packages + libraries
+
+    if not all_findings:
+        print("\nNo per-layer findings available.")
+        return
+
+    # Group by layer
+    layers = {}
+    for pkg in all_findings:
+        vulns = pkg.get("vulnerabilities", []) or []
+        for v in vulns:
+            layer_key = v.get("layerID") or v.get("layerDigest") \
+                        or pkg.get("layerID") or pkg.get("layerDigest") or "unknown"
+            layer_instruction = v.get("layerInstruction") \
+                        or pkg.get("layerInstruction") or ""
+            key = (layer_key, layer_instruction)
+            if key not in layers:
+                layers[key] = []
+            layers[key].append({
+                "cve": v.get("name", "N/A"),
+                "severity": (v.get("severity") or "UNKNOWN").upper(),
+                "component": pkg.get("name", "N/A"),
+                "version": pkg.get("version", "N/A"),
+                "fixed": v.get("fixedVersion", "N/A"),
+            })
+
+    if not layers:
+        print("\nNo per-layer findings available after grouping.")
+        return
+
+    bar = "=" * 100
+    print(f"\n{bar}\nPer-Layer Vulnerability Report\n{bar}")
+
+    # Sort layers by the shortest layer digest for stable display
+    sorted_layers = sorted(layers.items(), key=lambda x: str(x[0][0]))
+
+    for idx, ((layer_key, instruction), findings) in enumerate(sorted_layers):
+        # Count severities in this layer
+        sev_counts = {}
+        for f in findings:
+            sev_counts[f["severity"]] = sev_counts.get(f["severity"], 0) + 1
+
+        layer_short = str(layer_key)[:16] if layer_key != "unknown" else "unknown"
+        header = f"\nLayer #{idx + 1}  [{layer_short}]"
+        if instruction:
+            header += f"\n  Instruction: {instruction[:120]}"
+        print(header)
+
+        sev_summary = " | ".join(
+            f"{ANSI.get(s, '')}{s}: {sev_counts[s]}{ANSI['RESET']}"
+            for s in SEVERITY_ORDER if sev_counts.get(s)
+        )
+        print(f"  Findings: {len(findings)}  ({sev_summary})")
+
+        # Dedupe findings in this layer by component+cve, take top 5 most severe
+        findings.sort(key=lambda f: SEVERITY_ORDER.get(f["severity"], 99))
+        seen = set()
+        deduped = []
+        for f in findings:
+            key = (f["component"], f["cve"])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(f)
+        top = deduped[:5]
+
+        rows = [
+            [
+                wrap(f["cve"], 16),
+                f"{ANSI.get(f['severity'], '')}{f['severity']}{ANSI['RESET']}",
+                wrap(f["component"], 22),
+                wrap(f["version"], 14),
+                wrap(f["fixed"], 14),
+            ]
+            for f in top
+        ]
+        print(tabulate(
+            rows,
+            headers=["CVE", "SEVERITY", "COMPONENT", "VERSION", "FIXED"],
+            tablefmt="grid",
+        ))
+        if len(findings) > 5:
+            print(f"  ... and {len(findings) - 5} more in this layer")
+
+    # GitHub Step Summary section
+    summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with open(summary_path, "a") as f:
+            f.write("\n## Per-Layer Vulnerability Report\n\n")
+            for idx, ((layer_key, instruction), findings) in enumerate(sorted_layers):
+                sev_counts = {}
+                for fd in findings:
+                    sev_counts[fd["severity"]] = sev_counts.get(fd["severity"], 0) + 1
+
+                layer_short = str(layer_key)[:16] if layer_key != "unknown" else "unknown"
+                f.write(f"### Layer #{idx + 1} — `{layer_short}`\n\n")
+                if instruction:
+                    f.write(f"**Instruction:** `{instruction[:150]}`\n\n")
+                f.write(f"**Findings:** {len(findings)} — " + " | ".join(
+                    f"{EMOJI.get(s, '')} {s}: {sev_counts[s]}"
+                    for s in SEVERITY_ORDER if sev_counts.get(s)
+                ) + "\n\n")
+
+                findings.sort(key=lambda fd: SEVERITY_ORDER.get(fd["severity"], 99))
+                seen = set()
+                deduped = []
+                for fd in findings:
+                    key = (fd["component"], fd["cve"])
+                    if key not in seen:
+                        seen.add(key)
+                        deduped.append(fd)
+                top = deduped[:5]
+
+                md_rows = [
+                    [
+                        fd["cve"],
+                        f"{EMOJI.get(fd['severity'], '')} {fd['severity']}",
+                        fd["component"],
+                        fd["version"],
+                        fd["fixed"],
+                    ]
+                    for fd in top
+                ]
+                f.write(tabulate(
+                    md_rows,
+                    headers=["CVE", "Severity", "Component", "Version", "Fixed"],
+                    tablefmt="github",
+                ))
+                f.write("\n\n")
+                if len(findings) > 5:
+                    f.write(f"_... and {len(findings) - 5} more in this layer_\n\n")
+
+
 def main():
     any_found = False
     for title, path in SARIF_FILES:
@@ -258,7 +406,6 @@ def main():
                 deduped.append(r)
 
         # Keep only top 3 for a clean demo console table
-        # (Full SARIF still uploads to GitHub Security tab)
         rows = deduped[:3]
 
         counts = print_report(title, rows)
@@ -266,6 +413,9 @@ def main():
 
     if not any_found:
         print("No SARIF files found. Did the scan steps run?")
+
+    # Per-layer container image report (from --driver mountWithLayers JSON output)
+    print_layer_report("image-layers.json")
 
 
 if __name__ == "__main__":
