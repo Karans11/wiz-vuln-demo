@@ -48,7 +48,7 @@ jobs:
           echo "::group::🔍 Wiz SCA Scan"
           wizcli dir scan --path . \
             --output dir.sarif,sarif,vulnerabilities \
-            --output dir.txt,human,vulnerabilities
+            --output dir.txt,human,vulnerabilities || true
           echo "::endgroup::"
 
           echo "::group::📋 SCA Findings Table"
@@ -62,7 +62,7 @@ jobs:
           echo "::group::🔍 Wiz IaC Scan"
           wizcli iac scan --path ./Dockerfile \
             --output dockerfile.sarif,sarif,misconfigurations \
-            --output dockerfile.txt,human,misconfigurations
+            --output dockerfile.txt,human,misconfigurations || true
           echo "::endgroup::"
 
           echo "::group::📋 IaC Findings Table"
@@ -78,8 +78,24 @@ jobs:
           echo "::endgroup::"
         continue-on-error: true
 
-      # === Container image scan - per layer with mountWithLayers driver ===
-      - name: Wiz Container Image Scan (per-layer)
+      # === Container image scan for SARIF (default driver — reliable upload) ===
+      - name: Wiz Container Image Scan (SARIF)
+        if: success()
+        run: |
+          echo "::group::🔍 Wiz Container Image Scan (for SARIF upload)"
+          wizcli docker scan \
+            --image wiz-vuln-demo:${{ github.sha }} \
+            --output image.sarif,sarif,vulnerabilities \
+            --output image.txt,human,vulnerabilities || true
+          echo "::endgroup::"
+
+          echo "::group::📋 Image Findings Table"
+          cat image.txt || echo "No text output produced"
+          echo "::endgroup::"
+        continue-on-error: true
+
+      # === Container image scan for per-layer JSON (mountWithLayers needs root) ===
+      - name: Wiz Container Image Scan (per-layer JSON)
         if: success()
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
@@ -89,23 +105,31 @@ jobs:
           sudo -E $(which wizcli) auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
           echo "::endgroup::"
 
-          echo "::group::🔍 Wiz Container Image Scan - Per Layer"
+          echo "::group::🔍 Wiz Container Image Scan - Per Layer (JSON only)"
           sudo -E $(which wizcli) docker scan \
             --image wiz-vuln-demo:${{ github.sha }} \
             --driver mountWithLayers \
-            --output image.sarif,sarif,vulnerabilities \
-            --output image.txt,human,vulnerabilities \
-            --output image-layers.json,json,vulnerabilities
-          echo "::endgroup::"
-
-          # Fix file ownership so later steps can read them
-          sudo chown runner:runner image.sarif image.txt image-layers.json 2>/dev/null || true
-
-          echo "::group::📋 Image Findings Table"
-          cat image.txt || echo "No text output produced"
+            --output image-layers.json,json,vulnerabilities || true
           echo "::endgroup::"
         continue-on-error: true
 
+      # === Fix ownership on all output files so Python can overwrite them ===
+      - name: Fix file ownership
+        if: always()
+        run: |
+          echo "::group::📂 File ownership check"
+          echo "Before fix:"
+          ls -la *.sarif *.txt *.json 2>/dev/null || true
+          echo ""
+          echo "Taking ownership of all scan outputs..."
+          sudo chown -R $USER:$USER . 2>/dev/null || true
+          sudo chmod 666 *.sarif *.txt *.json 2>/dev/null || true
+          echo ""
+          echo "After fix:"
+          ls -la *.sarif *.txt *.json 2>/dev/null || true
+          echo "::endgroup::"
+
+      # === Diagnostic: inspect wizcli JSON structure ===
       - name: Inspect wizcli output structure
         if: always()
         run: |
@@ -127,17 +151,35 @@ jobs:
                       print(f'  vuln sample keys: {list(vulns[0].keys())}')
           " 2>/dev/null || echo "python inspect failed"
           echo "::endgroup::"
-      
-          echo "::group::📄 image.txt first 100 lines"
-          head -100 image.txt 2>/dev/null || echo "no image.txt"
-          echo "::endgroup::"
-       
+
       # === Enrich SARIF + print clean summary table + per-layer report ===
       - name: Enrich and Display Summary
         if: always()
         run: |
           echo "::group::📊 Enriched Summary Report"
           python .github/workflows/wizsarif.py
+          echo "::endgroup::"
+
+      # === Pre-upload diagnostics ===
+      - name: Diagnose image SARIF before upload
+        if: always() && hashFiles('image.sarif') != ''
+        run: |
+          echo "::group::📏 Image SARIF pre-upload diagnostics"
+          echo "File size: $(du -h image.sarif | cut -f1)"
+          echo "File size in bytes: $(wc -c < image.sarif)"
+          python3 -c "
+          import json
+          with open('image.sarif') as f:
+              s = json.load(f)
+          total_results = sum(len(r.get('results', [])) for r in s.get('runs', []))
+          total_rules = sum(len(r.get('tool', {}).get('driver', {}).get('rules', [])) for r in s.get('runs', []))
+          versions = [r.get('tool', {}).get('driver', {}).get('version', 'unknown') for r in s.get('runs', [])]
+          print(f'Total results: {total_results}')
+          print(f'Total rules: {total_rules}')
+          print(f'Tool versions: {versions}')
+          print(f'Schema: {s.get(\"\$schema\", \"none\")}')
+          print(f'Version: {s.get(\"version\", \"none\")}')
+          "
           echo "::endgroup::"
 
       # === Upload enriched SARIFs to GitHub Security tab ===
