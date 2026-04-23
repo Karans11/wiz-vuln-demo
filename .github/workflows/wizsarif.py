@@ -16,7 +16,6 @@ ANSI = {
     "RESET":    "\033[0m",
 }
 
-# Emoji indicators for the GitHub Step Summary markdown view
 EMOJI = {
     "CRITICAL": "🔴",
     "HIGH":     "🟠",
@@ -31,7 +30,6 @@ SEVERITY_ORDER = {
     "INFORMATIONAL": 4, "UNKNOWN": 5,
 }
 
-# CVSS-style numeric severity GitHub uses for proper severity badges
 SECURITY_SEVERITY = {
     "CRITICAL": "9.5",
     "HIGH":     "8.0",
@@ -41,7 +39,6 @@ SECURITY_SEVERITY = {
     "UNKNOWN":  "0.0",
 }
 
-# Map our severity to SARIF level (what GitHub displays as Error/Warning/Note)
 LEVEL_MAP = {
     "CRITICAL": "error",
     "HIGH":     "error",
@@ -51,7 +48,6 @@ LEVEL_MAP = {
     "UNKNOWN":  "note",
 }
 
-# SARIF `level` -> severity fallback when nothing else is available
 SARIF_LEVEL_TO_SEVERITY = {
     "error":   "HIGH",
     "warning": "MEDIUM",
@@ -65,57 +61,6 @@ SARIF_FILES = [
     ("Container Image",                    "image.sarif"),
 ]
 
-def cap_results(sarif, max_results=2000):
-    """
-    Aggressively trim large SARIFs so GitHub can successfully process them.
-
-    GitHub's docs say 25k max, but in practice large image SARIFs (>3000 results)
-    often fail during backend processing even though upload succeeds.
-    Keep highest-severity findings and drop unused rules to shrink the file.
-    """
-    severity_priority = {"error": 0, "warning": 1, "note": 2, "none": 3}
-
-    total_kept = 0
-    kept_rule_ids = set()
-
-    for run in sarif.get("runs", []):
-        results = run.get("results", []) or []
-        if not results:
-            continue
-
-        # Sort so highest-severity findings are kept
-        results.sort(key=lambda r: severity_priority.get(
-            (r.get("level") or "warning").lower(), 9
-        ))
-
-        remaining_budget = max(0, max_results - total_kept)
-        if len(results) > remaining_budget:
-            run["results"] = results[:remaining_budget]
-        total_kept += len(run["results"])
-
-        # Collect rule IDs actually used by the kept results
-        for r in run["results"]:
-            rid = r.get("ruleId")
-            if rid:
-                kept_rule_ids.add(rid)
-
-        # Drop unused rules — they bloat the file by 20-40%
-        tool_driver = run.get("tool", {}).get("driver", {})
-        all_rules = tool_driver.get("rules", []) or []
-        kept_rules = [r for r in all_rules if r.get("id") in kept_rule_ids]
-        tool_driver["rules"] = kept_rules
-
-        # Recalculate ruleIndex on each result to match the new rules array
-        rule_id_to_index = {r.get("id"): i for i, r in enumerate(kept_rules)}
-        for result in run["results"]:
-            rid = result.get("ruleId")
-            if rid and rid in rule_id_to_index:
-                result["ruleIndex"] = rule_id_to_index[rid]
-            else:
-                # Rule reference broken — remove the orphan ruleIndex
-                result.pop("ruleIndex", None)
-
-    return sarif
 
 def parse_message_text(text):
     """Parse 'Key: value' lines from Wiz's SARIF message text."""
@@ -141,7 +86,6 @@ def wrap(text, width):
 
 
 def severity_from_cvss(score_str):
-    """Convert a CVSS numeric score string to our severity labels."""
     try:
         score = float(score_str)
     except (TypeError, ValueError):
@@ -158,7 +102,6 @@ def severity_from_cvss(score_str):
 
 
 def get_rule_map(sarif):
-    """Build a map of ruleId -> rule definition for quick lookup."""
     rule_map = {}
     for run in sarif.get("runs", []):
         rules = (run.get("tool", {}).get("driver", {}).get("rules", []) or [])
@@ -170,55 +113,69 @@ def get_rule_map(sarif):
 
 
 def get_severity_for_result(result, rule_map):
-    """Look up severity from multiple possible SARIF locations."""
-    # 1. Try message.text "Severity: Medium" format (Wiz vulnerabilities)
     msg_text = (result.get("message") or {}).get("text", "")
     fields = parse_message_text(msg_text)
     sev = fields.get("severity", "").upper()
     if sev and sev in SECURITY_SEVERITY:
         return sev, fields
 
-    # 2. Try result.properties.severity
     props = result.get("properties") or {}
     prop_sev = str(props.get("severity", "")).upper()
     if prop_sev and prop_sev in SECURITY_SEVERITY:
         return prop_sev, fields
 
-    # 3. Try the rule definition's properties
     rid = result.get("ruleId")
     rule = rule_map.get(rid, {}) if rid else {}
     rule_props = rule.get("properties") or {}
 
-    # 3a. rule.properties.security-severity (numeric CVSS)
     css = rule_props.get("security-severity")
     if css:
         mapped = severity_from_cvss(css)
         if mapped:
             return mapped, fields
 
-    # 3b. rule.properties.severity
     rp_sev = str(rule_props.get("severity", "")).upper()
     if rp_sev and rp_sev in SECURITY_SEVERITY:
         return rp_sev, fields
 
-    # 3c. rule.properties.problem.severity
     problem = rule_props.get("problem") or {}
     problem_sev = str(problem.get("severity", "")).upper()
     if problem_sev and problem_sev in SECURITY_SEVERITY:
         return problem_sev, fields
 
-    # 4. Fall back to SARIF level
     default_cfg = rule.get("defaultConfiguration") or {}
     level = (result.get("level") or default_cfg.get("level") or "").lower()
     if level in SARIF_LEVEL_TO_SEVERITY:
         return SARIF_LEVEL_TO_SEVERITY[level], fields
 
     return "UNKNOWN", fields
+
+
+# ========================================================================
+# FIX #1: Set a proper tool version so GitHub doesn't flag "unknown"
+# ========================================================================
+def ensure_tool_metadata(sarif):
+    """Ensure tool.driver has name and version set — GitHub logs warnings otherwise."""
+    for run in sarif.get("runs", []):
+        tool = run.setdefault("tool", {})
+        driver = tool.setdefault("driver", {})
+        if not driver.get("name"):
+            driver["name"] = "Wiz CLI"
+        if not driver.get("version") or driver.get("version") == "unknown":
+            driver["version"] = "1.0.0"
+        if not driver.get("informationUri"):
+            driver["informationUri"] = "https://www.wiz.io/"
+    return sarif
+
+
+# ========================================================================
+# FIX #2: Rewrite titles into markdown only — keep text intact for parsing
+# ========================================================================
 def rewrite_alert_titles(sarif, scan_label):
     """
-    Rewrite result.message.text so the GitHub Code Scanning alert title
-    shows our custom format:
-        [Wiz CLI Scan] <CVE/Rule> : <Component> <ver> → <fix> : <custom message>
+    Put custom title in message.markdown only. Leave message.text UNCHANGED
+    so Wiz's 'Key: value' format is preserved for downstream parsing and
+    GitHub doesn't flag inconsistent message structure.
     """
     rule_map = get_rule_map(sarif)
 
@@ -231,8 +188,7 @@ def rewrite_alert_titles(sarif, scan_label):
             version = fields.get("version", "")
             fixed = fields.get("fixed version", "")
 
-            # Build the custom message based on scan type
-            if scan_label == "SCA" or scan_label == "Image":
+            if scan_label in ("SCA", "Image"):
                 parts = [f"[Wiz CLI Scan] {rule_id}"]
                 if component and version:
                     ver_info = f"{component} {version}"
@@ -241,30 +197,28 @@ def rewrite_alert_titles(sarif, scan_label):
                     parts.append(ver_info)
                 parts.append(f"{severity} vulnerability detected")
                 new_title = " : ".join(parts)
-
             elif scan_label == "IaC":
                 rule = rule_map.get(rule_id, {}) or {}
                 rule_name = rule.get("name") or ""
                 rule_short = (rule.get("shortDescription") or {}).get("text", "")
                 desc = rule_short or rule_name or "Misconfiguration detected"
                 new_title = f"[Wiz CLI Scan] {rule_name or rule_id} : {desc} : {severity}"
-
             else:
                 new_title = f"[Wiz CLI Scan] {rule_id}"
 
-            # Preserve the original detailed description, just prepend our title
             original_text = (result.get("message") or {}).get("text", "")
-            original_md = (result.get("message") or {}).get("markdown", "")
+            original_md = (result.get("message") or {}).get("markdown", "") or original_text
 
+            # CRITICAL: Keep text unchanged, only enhance markdown
             result["message"] = {
-                "text": f"{new_title}\n\n{original_text}",
-                "markdown": f"### {new_title}\n\n{original_md or original_text}",
+                "text": original_text if original_text else new_title,
+                "markdown": f"### {new_title}\n\n{original_md}",
             }
 
     return sarif
 
+
 def enrich_sarif_with_severity(sarif):
-    """Add security-severity to each rule so GitHub shows proper severity badges."""
     rule_map = get_rule_map(sarif)
     rule_severity = {}
 
@@ -291,6 +245,108 @@ def enrich_sarif_with_severity(sarif):
             if sev.lower() not in tags:
                 tags.append(sev.lower())
     return sarif
+
+
+# ========================================================================
+# FIX #3: Rewrite cap_results with strict rule-result consistency
+# ========================================================================
+def cap_results(sarif, max_results=1000):
+    """
+    Trim SARIF to max_results while maintaining strict ruleId/ruleIndex/rules
+    consistency. This is what GitHub's backend validation enforces.
+
+    Key invariants enforced:
+    1. Every result.ruleId MUST have a matching rule in tool.driver.rules
+    2. result.ruleIndex (if present) MUST point to the rule with matching id
+    3. Orphan results (ruleId with no matching rule) are DROPPED entirely
+    """
+    severity_priority = {"error": 0, "warning": 1, "note": 2, "none": 3}
+
+    for run in sarif.get("runs", []):
+        tool_driver = run.setdefault("tool", {}).setdefault("driver", {})
+        all_rules = tool_driver.get("rules", []) or []
+        original_rule_ids = {r.get("id") for r in all_rules if r.get("id")}
+
+        results = run.get("results", []) or []
+        if not results:
+            tool_driver["rules"] = []
+            continue
+
+        # Step 1: Drop orphan results whose ruleId doesn't exist in rules.
+        # This is the key fix — GitHub rejects SARIFs with dangling ruleIds.
+        valid_results = [
+            r for r in results
+            if r.get("ruleId") and r.get("ruleId") in original_rule_ids
+        ]
+
+        # Step 2: Sort by severity so highest-severity survives the cap
+        valid_results.sort(key=lambda r: severity_priority.get(
+            (r.get("level") or "warning").lower(), 9
+        ))
+
+        # Step 3: Apply the cap
+        capped_results = valid_results[:max_results]
+
+        # Step 4: Collect rule IDs actually used
+        used_rule_ids = {r.get("ruleId") for r in capped_results}
+
+        # Step 5: Filter rules to only those used, preserving order
+        kept_rules = [r for r in all_rules if r.get("id") in used_rule_ids]
+
+        # Step 6: Build authoritative id->index map from kept_rules
+        rule_id_to_index = {r.get("id"): i for i, r in enumerate(kept_rules)}
+
+        # Step 7: Fix every result's ruleIndex to match kept_rules exactly
+        for result in capped_results:
+            rid = result.get("ruleId")
+            # We guaranteed rid is in rule_id_to_index by step 1 + step 4
+            result["ruleIndex"] = rule_id_to_index[rid]
+
+        # Step 8: Commit
+        run["results"] = capped_results
+        tool_driver["rules"] = kept_rules
+
+    return sarif
+
+
+# ========================================================================
+# FIX #4: Final validation pass — catch any remaining schema issues
+# ========================================================================
+def validate_sarif(sarif, path):
+    """Sanity check before writing. Prints warnings for any issues."""
+    issues = []
+    for run_idx, run in enumerate(sarif.get("runs", [])):
+        rules = run.get("tool", {}).get("driver", {}).get("rules", []) or []
+        rule_ids = {r.get("id") for r in rules if r.get("id")}
+        rule_id_list = [r.get("id") for r in rules]
+
+        results = run.get("results", []) or []
+        for res_idx, r in enumerate(results):
+            rid = r.get("ruleId")
+            ridx = r.get("ruleIndex")
+
+            if not rid:
+                issues.append(f"  run[{run_idx}].results[{res_idx}]: missing ruleId")
+                continue
+
+            if rid not in rule_ids:
+                issues.append(f"  run[{run_idx}].results[{res_idx}]: ruleId '{rid}' not in rules array")
+
+            if ridx is not None:
+                if ridx < 0 or ridx >= len(rules):
+                    issues.append(f"  run[{run_idx}].results[{res_idx}]: ruleIndex {ridx} out of bounds")
+                elif rule_id_list[ridx] != rid:
+                    issues.append(f"  run[{run_idx}].results[{res_idx}]: ruleIndex {ridx} points to '{rule_id_list[ridx]}' but ruleId is '{rid}'")
+
+    if issues:
+        print(f"  ⚠️  Validation issues in {path}:")
+        for issue in issues[:10]:
+            print(issue)
+        if len(issues) > 10:
+            print(f"    ... and {len(issues) - 10} more issues")
+    else:
+        print(f"  ✅ {path} passed validation")
+    return len(issues) == 0
 
 
 def extract_rows(sarif):
@@ -325,7 +381,6 @@ def extract_rows(sarif):
 
             status = f"fixed in {fixed}" if fixed != "N/A" else "no fix"
 
-            # For IaC findings whose ruleId is a UUID, use rule.name if present
             display_rule = rule_id
             if rule_name and len(rule_id) > 30 and "-" in rule_id:
                 display_rule = rule_name
@@ -415,9 +470,6 @@ def write_summary(title, rows, counts):
 
 
 def _extract_layer_info(obj):
-    """
-    Returns (layer_id, instruction, index, is_base_layer) from layerMetadata.
-    """
     if not isinstance(obj, dict):
         return None, "", None, False
 
@@ -426,24 +478,15 @@ def _extract_layer_info(obj):
         return None, "", None, False
 
     layer_id = (
-        meta.get("id")
-        or meta.get("layerId")
-        or meta.get("layerID")
-        or meta.get("digest")
-        or meta.get("layerDigest")
-        or meta.get("sha")
-        or meta.get("hash")
+        meta.get("id") or meta.get("layerId") or meta.get("layerID")
+        or meta.get("digest") or meta.get("layerDigest")
+        or meta.get("sha") or meta.get("hash")
     )
 
-    # Wiz uses "details" to hold the Dockerfile-instruction-like string
     instruction = (
-        meta.get("details")
-        or meta.get("createdBy")
-        or meta.get("instruction")
-        or meta.get("command")
-        or meta.get("cmd")
-        or meta.get("layerInstruction")
-        or ""
+        meta.get("details") or meta.get("createdBy")
+        or meta.get("instruction") or meta.get("command")
+        or meta.get("cmd") or meta.get("layerInstruction") or ""
     )
 
     index = meta.get("index") or meta.get("layerIndex") or meta.get("order")
@@ -458,7 +501,6 @@ def _extract_layer_info(obj):
 
 
 def print_layer_report(json_path="image-layers.json"):
-    """Group findings by layerMetadata and print a per-layer report."""
     if not os.path.exists(json_path):
         print(f"\n(Skipping per-layer report: {json_path} not found)")
         return
@@ -480,7 +522,6 @@ def print_layer_report(json_path="image-layers.json"):
             print(f"(Layer report: no findings in result. Keys = {list(result.keys())})")
             return
 
-        # Group findings by (layer_id, instruction)
         layers = {}
         for pkg in all_findings:
             layer_id, instruction, index, is_base = _extract_layer_info(pkg)
@@ -507,7 +548,6 @@ def print_layer_report(json_path="image-layers.json"):
             print("(Layer report: no vulnerabilities found)")
             return
 
-        # Sort by layer index if we have it; otherwise by layer_id string
         def sort_key(item):
             (layer_id, _), payload = item
             return (payload["index"], str(layer_id))
@@ -530,8 +570,7 @@ def print_layer_report(json_path="image-layers.json"):
             print(f"  Digest:      {layer_id}")
             if instruction:
                 wrapped = textwrap.fill(
-                    instruction,
-                    width=140,
+                    instruction, width=140,
                     initial_indent="  Instruction: ",
                     subsequent_indent="               ",
                 )
@@ -571,7 +610,6 @@ def print_layer_report(json_path="image-layers.json"):
             if len(findings) > 5:
                 print(f"  ... and {len(findings) - 5} more in this layer")
 
-        # GitHub Step Summary
         summary_path = os.getenv("GITHUB_STEP_SUMMARY")
         if summary_path:
             with open(summary_path, "a") as f:
@@ -636,22 +674,27 @@ def main():
             with open(path) as f:
                 sarif = json.load(f)
 
-            # 1. Enrich: add security-severity to each rule
+            # 1. Ensure tool metadata (fixes "version: unknown" warning)
+            sarif = ensure_tool_metadata(sarif)
+
+            # 2. Enrich: add security-severity to each rule
             sarif = enrich_sarif_with_severity(sarif)
 
-            # 2. Rewrite titles: [Wiz CLI Scan] CVE : component : severity
+            # 3. Rewrite titles (markdown-only — text preserved)
             scan_label = "SCA" if "dir" in path else (
                 "IaC" if "dockerfile" in path else "Image"
             )
             sarif = rewrite_alert_titles(sarif, scan_label)
 
-            # 3. Cap results LAST so ruleIndex gets recomputed correctly
+            # 4. Cap results with strict rule-result consistency
             if "image" in path.lower():
-                sarif = cap_results(sarif, max_results=2000)
+                sarif = cap_results(sarif, max_results=1000)
             else:
-                sarif = cap_results(sarif, max_results=25000)
+                sarif = cap_results(sarif, max_results=5000)
 
-            # Save compact SARIF for upload
+            # 5. Validate before writing
+            validate_sarif(sarif, path)
+
             with open(path, "w") as f:
                 json.dump(sarif, f, separators=(",", ":"))
 
@@ -659,12 +702,14 @@ def main():
             result_count = sum(
                 len(run.get("results", [])) for run in sarif.get("runs", [])
             )
-            print(f"  Saved {path}: {size_kb:.1f} KB, {result_count} results")
+            rule_count = sum(
+                len(run.get("tool", {}).get("driver", {}).get("rules", []))
+                for run in sarif.get("runs", [])
+            )
+            print(f"  Saved {path}: {size_kb:.1f} KB, {result_count} results, {rule_count} rules")
 
-            # Extract rows from the enriched (in-memory) SARIF for printing
             rows = extract_rows(sarif)
 
-            # Dedupe
             seen = set()
             deduped = []
             for r in rows:
@@ -684,11 +729,11 @@ def main():
     if not any_found:
         print("No SARIF files found. Did the scan steps run?")
 
-    # Per-layer container image report (from --driver mountWithLayers JSON)
     try:
         print_layer_report("image-layers.json")
     except Exception as e:
         print(f"\n(Per-layer report outer failure: {e})")
+
 
 if __name__ == "__main__":
     main()
