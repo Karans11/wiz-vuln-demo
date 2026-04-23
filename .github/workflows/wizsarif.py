@@ -219,23 +219,41 @@ def rewrite_alert_titles(sarif, scan_label):
 
 
 # ========================================================================
-# FIX #5 (THE REAL FIX): Normalize image SARIF locations to a repo-relative
-# path. GitHub Code Scanning rejects SARIFs where artifactLocation.uri
-# points to container image references like "docker.io/library/foo:sha256..."
-# because it expects URIs to resolve to files in the repository.
+# FIX #5 (REVISED): Normalize image SARIF locations AND add partial
+# fingerprints. GitHub Code Scanning rejects SARIFs where many results
+# collapse to the same (uri, line) — fingerprint generation fails and
+# the analysis is rejected during processing.
 #
-# Convention used by Trivy/Grype/Snyk: map all container findings to
-# "Dockerfile" (or whatever built the image), preserving the original
-# image URI inside properties.imageRef for traceability.
+# We solve this by:
+#  1. Rewriting docker URIs → "Dockerfile" (repo-relative path)
+#  2. Spreading startLine values so each (ruleId, component, version)
+#     combination gets a unique synthetic line number (cycling through
+#     a range to keep them visually clustered in the Dockerfile view)
+#  3. Pre-computing partialFingerprints so GitHub doesn't have to guess
 # ========================================================================
-def normalize_image_locations(sarif, target_path="Dockerfile"):
+import hashlib
+
+
+def _parse_msg_fields(text):
+    """Extract component/version from Wiz's Key: value message format."""
+    fields = {}
+    if not text:
+        return fields
+    for line in text.split("\n"):
+        if ":" in line:
+            k, _, v = line.partition(":")
+            fields[k.strip().lower()] = v.strip()
+    return fields
+
+
+def normalize_image_locations(sarif, target_path="Dockerfile", max_line=1000):
     """
-    Rewrite all artifactLocation.uri values in container image SARIFs so
-    GitHub's backend can map them to a real repo file. The original image
-    reference is preserved in result.properties.imageRef.
+    Rewrite artifactLocation.uri to a repo-relative path, give each result
+    a unique startLine (based on ruleId+component+version hash), and add
+    pre-computed partialFingerprints so GitHub's processor doesn't reject
+    the SARIF during fingerprint generation.
     """
     for run in sarif.get("runs", []):
-        # Set originalUriBaseIds so GitHub knows the URIs are repo-relative
         run.setdefault("originalUriBaseIds", {})
         run["originalUriBaseIds"]["SRCROOT"] = {
             "uri": "file:///",
@@ -243,42 +261,69 @@ def normalize_image_locations(sarif, target_path="Dockerfile"):
         }
 
         for result in run.get("results", []):
+            rule_id = result.get("ruleId", "unknown")
+
+            # Extract component+version from the message for uniqueness
+            msg_text = (result.get("message") or {}).get("text", "")
+            fields = _parse_msg_fields(msg_text)
+            component = fields.get("component", "")
+            version = fields.get("version", "")
+
+            # Build a unique fingerprint key from (ruleId, component, version)
+            fingerprint_key = f"{rule_id}|{component}|{version}"
+            fp_hash = hashlib.sha256(fingerprint_key.encode()).hexdigest()
+
+            # Synthetic startLine from hash — deterministic & unique-ish
+            # Modulo max_line keeps it in a reasonable range for display
+            synthetic_line = (int(fp_hash[:8], 16) % max_line) + 1
+
             locations = result.get("locations") or []
             if not locations:
-                # Every result MUST have at least one location for GitHub
                 result["locations"] = [{
                     "physicalLocation": {
                         "artifactLocation": {
                             "uri": target_path,
                             "uriBaseId": "SRCROOT",
                         },
-                        "region": {"startLine": 1},
+                        "region": {
+                            "startLine": synthetic_line,
+                            "endLine": synthetic_line,
+                        },
                     }
                 }]
-                continue
+            else:
+                for loc in locations:
+                    phys = loc.setdefault("physicalLocation", {})
+                    art = phys.setdefault("artifactLocation", {})
+                    original_uri = art.get("uri", "")
 
-            for loc in locations:
-                phys = loc.setdefault("physicalLocation", {})
-                art = phys.setdefault("artifactLocation", {})
-                original_uri = art.get("uri", "")
+                    # Save original container image reference
+                    if original_uri and (
+                        original_uri.startswith("docker.io/")
+                        or ":sha256:" in original_uri
+                        or "@sha256:" in original_uri
+                        or ("/" in original_uri and ":" in original_uri)
+                    ):
+                        props = result.setdefault("properties", {})
+                        props["imageRef"] = original_uri
 
-                # Save original image reference for reference
-                if original_uri and (
-                    original_uri.startswith("docker.io/")
-                    or ":sha256:" in original_uri
-                    or "@sha256:" in original_uri
-                    or "/" in original_uri and ":" in original_uri
-                ):
-                    props = result.setdefault("properties", {})
-                    props["imageRef"] = original_uri
+                    # Rewrite to repo-relative path
+                    art["uri"] = target_path
+                    art["uriBaseId"] = "SRCROOT"
 
-                # Rewrite to repo-relative path
-                art["uri"] = target_path
-                art["uriBaseId"] = "SRCROOT"
+                    # Use synthetic startLine for uniqueness
+                    phys["region"] = {
+                        "startLine": synthetic_line,
+                        "endLine": synthetic_line,
+                    }
 
-                # Ensure region exists — GitHub requires it
-                if "region" not in phys:
-                    phys["region"] = {"startLine": 1}
+            # CRITICAL: Pre-compute partialFingerprints so GitHub doesn't
+            # auto-generate (which is failing at scale for image scans).
+            # primaryLocationLineHash is the fingerprint GitHub uses most.
+            result["partialFingerprints"] = {
+                "primaryLocationLineHash": fp_hash[:16],
+                "wizFingerprint/v1": fp_hash,
+            }
 
     return sarif
 
