@@ -70,7 +70,7 @@ jobs:
           echo "::endgroup::"
         continue-on-error: true
 
-      # === Container image scan ===
+      # === Container image build ===
       - name: Build Docker Image
         run: |
           echo "::group::🐳 Docker Build"
@@ -78,11 +78,19 @@ jobs:
           echo "::endgroup::"
         continue-on-error: true
 
-      - name: Wiz Container Image Scan
+      # === Container image scan - per layer with mountWithLayers driver ===
+      - name: Wiz Container Image Scan (per-layer)
         if: success()
+        env:
+          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
-          echo "::group::🔍 Wiz Container Image Scan"
-          wizcli docker scan \
+          echo "::group::🔑 Re-auth wizcli as root (needed for overlay2 driver)"
+          sudo -E $(which wizcli) auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+          echo "::endgroup::"
+
+          echo "::group::🔍 Wiz Container Image Scan - Per Layer"
+          sudo -E $(which wizcli) docker scan \
             --image wiz-vuln-demo:${{ github.sha }} \
             --driver mountWithLayers \
             --output image.sarif,sarif,vulnerabilities \
@@ -90,12 +98,15 @@ jobs:
             --output image-layers.json,json,vulnerabilities
           echo "::endgroup::"
 
+          # Fix file ownership so later steps can read them
+          sudo chown runner:runner image.sarif image.txt image-layers.json 2>/dev/null || true
+
           echo "::group::📋 Image Findings Table"
           cat image.txt || echo "No text output produced"
           echo "::endgroup::"
         continue-on-error: true
 
-      # === Enrich SARIF + print clean summary table ===
+      # === Enrich SARIF + print clean summary table + per-layer report ===
       - name: Enrich and Display Summary
         if: always()
         run: |
