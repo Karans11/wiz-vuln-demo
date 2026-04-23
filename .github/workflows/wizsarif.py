@@ -83,7 +83,6 @@ def wrap(text, width):
 
 def enrich_sarif_with_severity(sarif):
     """Add security-severity to each rule so GitHub shows proper severity badges."""
-    # First, build a map of ruleId -> severity by scanning results
     rule_severity = {}
     for run in sarif.get("runs", []):
         for result in run.get("results", []):
@@ -91,13 +90,18 @@ def enrich_sarif_with_severity(sarif):
             msg_text = (result.get("message") or {}).get("text", "")
             fields = parse_message_text(msg_text)
             sev = fields.get("severity", "").upper() or "UNKNOWN"
-            if rid and sev:
+
+            # Normalize unexpected Wiz severity values to our known set
+            if sev not in SECURITY_SEVERITY:
+                sev = "UNKNOWN"
+
+            if rid:
                 rule_severity[rid] = sev
 
-            # Also update the result level to match
+            # Update result level so GitHub shows Error/Warning/Note correctly
             result["level"] = LEVEL_MAP.get(sev, "warning")
 
-    # Then, enrich each rule definition
+    # Enrich each rule definition with the security severity score
     for run in sarif.get("runs", []):
         tool = run.get("tool", {}).get("driver", {})
         rules = tool.get("rules", []) or []
@@ -105,8 +109,7 @@ def enrich_sarif_with_severity(sarif):
             rid = rule.get("id")
             sev = rule_severity.get(rid, "UNKNOWN")
             props = rule.setdefault("properties", {})
-            props["security-severity"] = SECURITY_SEVERITY[sev]
-            # Tags help GitHub filtering
+            props["security-severity"] = SECURITY_SEVERITY.get(sev, "0.0")
             tags = props.setdefault("tags", [])
             if "security" not in tags:
                 tags.append("security")
